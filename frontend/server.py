@@ -178,24 +178,61 @@ def _build_followup(result: dict, state: dict) -> str:
         return f"I need a few more details — {', '.join(parts[:-1])}, and {parts[-1]}?"
 
 
-@weave.op()
-def pipeline_turn(message: str, request_id: int | None, complaint: str | None, transcript: str) -> dict:
-    """Full agent pipeline for one conversation turn — traced in Weave.
+@weave.op(name="Vera-Voice-Intake")
+def stage_vera(message: str) -> dict:
+    """Vera: Captures technician speech and converts to text."""
+    return vera.predict(text=message)
 
-    Shows: Vera (voice intake) → GEMI (structuring) → Hade (validation) → WFM (close)
-    """
-    # Stage 1: Vera — voice/text intake processing
-    vera_output = vera.predict(text=message)
-    processed_text = vera_output.get("transcript", message)
 
-    # Build context for structuring
-    full_transcript = (transcript or "") + " " + processed_text
+@weave.op(name="LangGraph-Orchestrator")
+def stage_orchestrator(message: str, complaint: str | None, transcript: str) -> dict:
+    """LangGraph: Routes intent, builds context for structuring."""
+    full_transcript = (transcript or "") + " " + message
     context_text = full_transcript
     if complaint:
         context_text = f"Reported problem: {complaint}\n\nTechnician close-out: {full_transcript}"
+    return {
+        "context_text": context_text,
+        "full_transcript": full_transcript,
+        "route": "structure → validate → close",
+    }
 
-    # Stage 2: GEMI — structure into PCRM codes
-    gemi_output = gemi.structure(context_text)
+
+@weave.op(name="GEMI-Structuring")
+def stage_gemi(context_text: str) -> dict:
+    """GEMI: Maps technician speech to PCRM work codes via LLM."""
+    return gemi.structure(context_text)
+
+
+@weave.op(name="Hade-Validation")
+def stage_hade(context_text: str, gemi_output: dict) -> dict:
+    """Hade: Validates codes, cross-checks semantics, corrects errors."""
+    return hade.validate_and_correct(context_text, gemi_output, gemi_agent=gemi)
+
+
+@weave.op(name="WFM-Close-Out")
+def stage_wfm_close(request_id: int, codes: dict) -> dict:
+    """WFM: Writes validated close-out codes to the work management system."""
+    return hade.close(request_id, codes)
+
+
+@weave.op(name="Mainline-Pipeline")
+def pipeline_turn(message: str, request_id: int | None, complaint: str | None, transcript: str) -> dict:
+    """Full agent pipeline — each stage is a separate traced operation in Weave.
+
+    Vera → LangGraph → GEMI → Hade → WFM
+    """
+    # Stage 1: Vera — voice/text intake
+    vera_output = stage_vera(message)
+    processed_text = vera_output.get("transcript", message)
+
+    # Stage 2: LangGraph Orchestrator — route and build context
+    orch_output = stage_orchestrator(processed_text, complaint, transcript)
+    context_text = orch_output["context_text"]
+    full_transcript = orch_output["full_transcript"]
+
+    # Stage 3: GEMI — structure into PCRM codes
+    gemi_output = stage_gemi(context_text)
 
     if gemi_output.get("needs_clarification"):
         return {
@@ -204,8 +241,8 @@ def pipeline_turn(message: str, request_id: int | None, complaint: str | None, t
             "transcript": full_transcript,
         }
 
-    # Stage 3: Hade — validate and correct
-    hade_output = hade.validate_and_correct(context_text, gemi_output, gemi_agent=gemi)
+    # Stage 4: Hade — validate and correct
+    hade_output = stage_hade(context_text, gemi_output)
     codes = {
         "problem_code": hade_output.get("problem_code"),
         "cause_code": hade_output.get("cause_code"),
@@ -213,16 +250,28 @@ def pipeline_turn(message: str, request_id: int | None, complaint: str | None, t
         "method_code": hade_output.get("method_code"),
     }
 
-    # Stage 4: WFM — close the job
+    # Stage 5: WFM — close the job
     if request_id:
-        hade.close(request_id, codes)
+        stage_wfm_close(request_id, codes)
 
     return {
         "stage": "confirm",
         "codes": codes,
         "transcript": full_transcript,
         "hade_approved": hade_output.get("_hade_approved", True),
-        "agent_chain": hade_output.get("_agent_chain", "Vera → GEMI → Hade"),
+        "agent_chain": "Vera → LangGraph → GEMI → Hade → WFM",
+    }
+
+
+@weave.op(name="LangGraph-Job-Resolution")
+def stage_resolve_job(message: str) -> dict:
+    """LangGraph: Classify intent and resolve job from WFM."""
+    intent = classify_intent(message)
+    results = hade.search(message) if intent in (Intent.CLOSE_OUT, Intent.NEW_FAULT) else []
+    return {
+        "intent": intent.value,
+        "results": results,
+        "resolved": bool(results),
     }
 
 
@@ -240,15 +289,14 @@ def _advance(state: dict, message: str) -> dict:
     state["turn"] = state.get("turn", 0) + 1
 
     if not state.get("request_id"):
-        intent = classify_intent(message)
-        if intent not in (Intent.CLOSE_OUT, Intent.NEW_FAULT):
+        resolution = stage_resolve_job(message)
+        if resolution["intent"] not in (Intent.CLOSE_OUT.value, Intent.NEW_FAULT.value):
             state["convo"].append(["agent", "I can help you close out a job or report a new fault. Which would you like to do?"])
             return state
 
-        results = hade.search(message)
-        if results:
-            state["request_id"] = results[0]["REQUEST_ID"]
-            state["complaint"] = results[0].get("CUST_PROB_DESCR", "")
+        if resolution["results"]:
+            state["request_id"] = resolution["results"][0]["REQUEST_ID"]
+            state["complaint"] = resolution["results"][0].get("CUST_PROB_DESCR", "")
             state["convo"].append(["agent", f"Found job #{state['request_id']} — reported as: \"{state['complaint']}\". What did you find on site, and how did you fix it?"])
         else:
             state["convo"].append(["agent", "Tell me about the job — what was the problem, what caused it, and how did you fix it?"])

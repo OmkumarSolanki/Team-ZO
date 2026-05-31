@@ -1,7 +1,12 @@
 """Orchestrator state machine using LangGraph.
 
-Routes by intent, manages the clarification loop,
-runs guardrails, and coordinates all agents via A2A-style messaging.
+Coordinates 3 agents:
+  - Vera (Voice Agent): STT transcription
+  - GEMI (Structuring Agent): Maps transcript to PCRM codes
+  - Hade (HelpDesk Agent): Validates, guardrails, corrects, and posts to WFM
+
+Routes by intent, manages the clarification/correction loop,
+and coordinates all agents via A2A-style messaging.
 """
 from __future__ import annotations
 
@@ -12,9 +17,9 @@ import weave
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
-from agents.helpdesk_agent import HelpDeskAgent
-from agents.structuring_agent import StructuringAgent
-from agents.voice_agent import VoiceAgent
+from agents.helpdesk_agent import Hade
+from agents.structuring_agent import GEMI
+from agents.voice_agent import Vera
 from orchestrator.intents import Intent, classify_intent
 from weave_eval.scorers import consistency_guard
 
@@ -33,10 +38,11 @@ class OrchestratorState(TypedDict):
     status: str
 
 
-voice_agent = VoiceAgent()
-structuring_agent_closeout = StructuringAgent(mode="close_out")
-structuring_agent_newfault = StructuringAgent(mode="new_fault")
-helpdesk_agent = HelpDeskAgent()
+# Agents
+vera = Vera()
+gemi_closeout = GEMI(mode="close_out")
+gemi_newfault = GEMI(mode="new_fault")
+hade = Hade()
 
 
 @weave.op()
@@ -54,13 +60,13 @@ def search_request_node(state: OrchestratorState) -> dict:
     transcript = state["transcript"]
     trace = state.get("trace", [])
 
-    results = helpdesk_agent.search(transcript)
-    trace.append(f"HelpDesk: Searched WFM, found {len(results)} matching requests")
+    results = hade.search(transcript)
+    trace.append(f"Hade: Searched WFM, found {len(results)} matching requests")
 
     request_id = None
     if results:
         request_id = results[0]["REQUEST_ID"]
-        trace.append(f"HelpDesk: Resolved to REQUEST_ID {request_id}")
+        trace.append(f"Hade: Resolved to REQUEST_ID {request_id}")
 
     wandb.log({"orchestrator/search_results": len(results)})
     return {"request_id": request_id, "trace": trace}
@@ -74,9 +80,9 @@ def structure_node(state: OrchestratorState) -> dict:
     clarification_resp = state.get("clarification_response", "")
 
     if intent == Intent.CLOSE_OUT.value:
-        agent = structuring_agent_closeout
+        agent = gemi_closeout
     else:
-        agent = structuring_agent_newfault
+        agent = gemi_newfault
 
     context = {}
     if state.get("request_id"):
@@ -86,13 +92,13 @@ def structure_node(state: OrchestratorState) -> dict:
         context["previous_payload"] = state.get("structured_payload", {})
 
     result = agent.structure(transcript, context if context else None)
-    trace.append(f"Structuring: Mapped transcript to codes (model={result.get('_model', 'unknown')})")
+    trace.append(f"GEMI: Mapped transcript to codes (model={result.get('_model', 'unknown')})")
 
     low_confidence = {
         k: v for k, v in result.get("field_confidence", {}).items() if v < 0.6
     }
     if low_confidence:
-        trace.append(f"Structuring: Low confidence on {list(low_confidence.keys())}")
+        trace.append(f"GEMI: Low confidence on {list(low_confidence.keys())}")
 
     wandb.log({
         "orchestrator/structuring_tokens": result.get("_tokens", 0),
@@ -112,8 +118,8 @@ def clarification_node(state: OrchestratorState) -> dict:
     if clarify:
         question = clarify.get("question", "Can you provide more details?")
         options = clarify.get("options", [])
-        voice_result = voice_agent.ask_clarification(question, options)
-        trace.append(f"Voice: Asked clarification — {question}")
+        voice_result = vera.ask_clarification(question, options)
+        trace.append(f"Vera: Asked clarification — {question}")
         trace.append(f"Orchestrator: Clarification loop iteration {count + 1}")
     else:
         trace.append("Orchestrator: No clarification needed")
@@ -127,7 +133,7 @@ def guardrail_node(state: OrchestratorState) -> dict:
     trace = state.get("trace", [])
 
     guard_result = consistency_guard(payload)
-    trace.append(f"Guardrail: {'PASSED' if guard_result['safe'] else 'BLOCKED — ' + str(guard_result.get('issue'))}")
+    trace.append(f"Hade: Guardrail {'PASSED' if guard_result['safe'] else 'BLOCKED — ' + str(guard_result.get('issue'))}")
 
     wandb.log({"orchestrator/guardrail_passed": guard_result["safe"]})
 
@@ -147,7 +153,7 @@ def validate_and_post_node(state: OrchestratorState) -> dict:
     if intent == Intent.CLOSE_OUT.value:
         request_id = state.get("request_id")
         if not request_id:
-            trace.append("HelpDesk: ERROR — No request_id resolved, cannot close")
+            trace.append("Hade: ERROR — No request_id resolved, cannot close")
             return {"final_result": {"status": "error", "reason": "no request_id"}, "trace": trace, "status": "error"}
 
         codes = {
@@ -158,19 +164,19 @@ def validate_and_post_node(state: OrchestratorState) -> dict:
             "method_code": payload.get("method_code"),
         }
 
-        val = helpdesk_agent.validate(codes, "close_out")
-        trace.append(f"HelpDesk: Validation {'passed' if val['ok'] else 'FAILED: ' + str(val['errors'])}")
+        val = hade.validate(codes, "close_out")
+        trace.append(f"Hade: Validation {'passed' if val['ok'] else 'FAILED: ' + str(val['errors'])}")
 
         if val["ok"]:
-            result = helpdesk_agent.close(request_id, codes)
-            trace.append(f"HelpDesk: Closed request {request_id} → {result.get('new_status')}")
+            result = hade.close(request_id, codes)
+            trace.append(f"Hade: Closed request {request_id} → {result.get('new_status')}")
         else:
             result = {"status": "validation_failed", "errors": val["errors"]}
-            trace.append("HelpDesk: Close aborted due to validation errors")
+            trace.append("Hade: Close aborted due to validation errors")
 
     else:
         result = {"status": "new_fault_posted", "payload": payload}
-        trace.append("HelpDesk: New fault request posted")
+        trace.append("Hade: New fault request posted")
 
     wandb.log({"orchestrator/final_status": result.get("status")})
 
@@ -182,8 +188,8 @@ def confirm_node(state: OrchestratorState) -> dict:
     result = state.get("final_result", {})
     trace = state.get("trace", [])
 
-    confirmation = voice_agent.confirm_result(result)
-    trace.append(f"Voice: Read back — {confirmation}")
+    confirmation = vera.confirm_result(result)
+    trace.append(f"Vera: Read back — {confirmation}")
 
     return {"trace": trace, "status": "confirmed"}
 

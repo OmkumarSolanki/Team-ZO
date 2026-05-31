@@ -35,19 +35,33 @@ def _load_schema() -> dict:
 
 @weave.op()
 def search_requests(text: str) -> list[dict]:
-    """Search open/active requests by free text (address, description, ID)."""
+    """Search requests by free text (address, description, ID, or keywords)."""
     conn = _get_conn()
     cur = conn.cursor()
+
+    words = [w.strip() for w in text.split() if len(w.strip()) > 2]
+    conditions = [
+        "CAST(REQUEST_ID AS TEXT) = ?",
+        "CUST_PROB_DESCR LIKE ?",
+        "PLACE_ID LIKE ?",
+        "CAST(ADDRESS_ID AS TEXT) LIKE ?",
+    ]
+    params = [text, f"%{text}%", f"%{text}%", f"%{text}%"]
+
+    for word in words:
+        conditions.append("CUST_PROB_DESCR LIKE ?")
+        params.append(f"%{word}%")
+
+    where = " OR ".join(conditions)
     cur.execute(
-        """
+        f"""
         SELECT REQUEST_ID, REQ_STATUS, REQ_CLASS, PRIORITY, SEVERITY,
                CUST_PROB_DESCR, PLACE_ID, ADDRESS_ID, USER_DEF21
         FROM request
-        WHERE CUST_PROB_DESCR LIKE ? OR PLACE_ID LIKE ? OR CAST(ADDRESS_ID AS TEXT) LIKE ?
-              OR CAST(REQUEST_ID AS TEXT) = ?
+        WHERE {where}
         LIMIT 10
         """,
-        [f"%{text}%", f"%{text}%", f"%{text}%", text],
+        params,
     )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()

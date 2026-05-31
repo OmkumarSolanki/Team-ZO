@@ -9,9 +9,8 @@ import json
 from typing import Any
 
 import weave
-from openai import OpenAI
 
-from config import MODEL
+from config import MODEL, get_client
 from mcp_servers.wfm_server import MCP_TOOLS, TOOL_DISPATCH
 
 
@@ -25,7 +24,7 @@ class HelpDeskAgent(weave.Model):
     @weave.op()
     def execute(self, task: str, context: dict | None = None) -> dict:
         """Execute a help desk task using MCP tools."""
-        client = OpenAI()
+        client = get_client()
 
         system = """You are a help desk agent for a water utility WFM system.
 You have access to tools to search, get, validate, and close work requests.

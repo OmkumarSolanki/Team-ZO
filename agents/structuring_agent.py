@@ -10,9 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import weave
-from openai import OpenAI
 
-from config import MODEL
+from config import MODEL, get_client
 
 CODES_PATH = Path(__file__).parent.parent / "data" / "codes.json"
 
@@ -136,7 +135,7 @@ class StructuringAgent(weave.Model):
 
     @weave.op()
     def structure(self, transcript: str, context: dict | None = None) -> dict:
-        client = OpenAI()
+        client = get_client()
         system_prompt = _build_system_prompt(self.mode)
 
         messages = [{"role": "system", "content": system_prompt}]

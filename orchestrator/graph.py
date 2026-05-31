@@ -151,6 +151,7 @@ def validate_and_post_node(state: OrchestratorState) -> dict:
             return {"final_result": {"status": "error", "reason": "no request_id"}, "trace": trace, "status": "error"}
 
         codes = {
+            "request_id": request_id,
             "problem_code": payload.get("problem_code"),
             "cause_code": payload.get("cause_code"),
             "rectify_code": payload.get("rectify_code"),

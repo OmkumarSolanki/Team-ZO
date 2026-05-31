@@ -4,9 +4,8 @@ from __future__ import annotations
 from enum import Enum
 
 import weave
-from openai import OpenAI
 
-from config import MODEL
+from config import MODEL, get_client
 
 
 class Intent(str, Enum):
@@ -19,7 +18,7 @@ class Intent(str, Enum):
 @weave.op()
 def classify_intent(transcript: str) -> Intent:
     """Classify the technician's intent from their transcript."""
-    client = OpenAI()
+    client = get_client()
     response = client.chat.completions.create(
         model=MODEL,
         messages=[

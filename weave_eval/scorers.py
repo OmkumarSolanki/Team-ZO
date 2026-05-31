@@ -10,9 +10,8 @@ from __future__ import annotations
 import json
 
 import weave
-from openai import OpenAI
 
-from config import JUDGE_MODEL
+from config import JUDGE_MODEL, get_client
 
 
 @weave.op()
@@ -44,7 +43,7 @@ class PriorityJudge(weave.Scorer):
     @weave.op()
     def score(self, output: dict, expected: dict) -> dict:
         """LLM-as-judge: is the priority justified by the transcript?"""
-        client = OpenAI()
+        client = get_client()
         transcript = expected.get("transcript", expected.get("cust_prob_descr", ""))
         assigned_priority = output.get("priority", output.get("problem_code", ""))
 

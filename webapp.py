@@ -207,14 +207,19 @@ def extract_ready_signal(response: str) -> dict | None:
 
 
 def text_to_speech(text: str) -> bytes | None:
-    """TTS using macOS say."""
+    """TTS using macOS `say` when available; gracefully degrades on Linux/Windows."""
     import subprocess
+    import shutil
+
+    if not shutil.which("say"):
+        return None
+
     with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as f:
         try:
             subprocess.run(["say", "-o", f.name, text], check=True, capture_output=True)
             with open(f.name, "rb") as audio_file:
                 return audio_file.read()
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, FileNotFoundError):
             return None
 
 

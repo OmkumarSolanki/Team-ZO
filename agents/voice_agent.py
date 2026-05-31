@@ -138,16 +138,24 @@ class Vera(weave.Model):
 
     @weave.op()
     def speak(self, text: str, output_path: str = None) -> dict:
-        """Convert text to speech (uses macOS say as fallback)."""
+        """Convert text to speech (uses macOS `say` when available)."""
         if output_path is None:
             output_path = str(RECORDINGS_DIR / "response.wav")
 
-        # Use macOS built-in TTS (no API key needed)
+        import shutil
         import subprocess
-        subprocess.run(
-            ["say", "-o", output_path, "--data-format=LEF32@22050", text],
-            check=True,
-        )
+
+        if not shutil.which("say"):
+            return {"audio_path": None, "text": text, "tts_skipped": "say_unavailable"}
+
+        try:
+            subprocess.run(
+                ["say", "-o", output_path, "--data-format=LEF32@22050", text],
+                check=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            return {"audio_path": None, "text": text, "tts_error": str(e)}
+
         return {"audio_path": output_path, "text": text}
 
     @weave.op()

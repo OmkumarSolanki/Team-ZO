@@ -1,10 +1,10 @@
-"""Web frontend — Starlette + Uvicorn.
+"""Mainline — Web Frontend.
 
 Multi-page app:
-  /           — Dashboard (pending + completed tabs)
-  /chat?id=X  — Chat for a specific ticket (continuous voice)
-  /chat       — Free-form chat (no ticket pre-selected)
-  /turn       — AJAX endpoint for conversation turns
+  /           — Dashboard (stats, pending tickets, completed history)
+  /chat?id=X  — Voice close-out for a specific ticket
+  /chat       — Free-form voice close-out
+  /turn       — AJAX conversation endpoint
 
 Continuous voice via browser Web Speech API.
 Agent auto-speaks via SpeechSynthesis.
@@ -25,7 +25,7 @@ import uvicorn
 import weave
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 from starlette.concurrency import run_in_threadpool
 
@@ -55,20 +55,44 @@ def _load_codes():
 
 
 def _code_label(code: str) -> str:
+    if not code:
+        return "—"
     codes = _load_codes()
     for category in codes.values():
         for item in category:
             if item["code"] == code:
                 return item["label"]
-    return code or "—"
+    return code
+
+
+def _get_stats():
+    conn = _get_conn()
+    cur = conn.execute("SELECT REQ_STATUS, COUNT(*) as cnt FROM request GROUP BY REQ_STATUS")
+    stats = {r["REQ_STATUS"]: r["cnt"] for r in cur.fetchall()}
+    cur2 = conn.execute("SELECT COUNT(DISTINCT REQ_CLASS) as classes FROM request")
+    classes = cur2.fetchone()["classes"]
+    conn.close()
+    return {
+        "pending": stats.get("FIELDCOMPLETE", 0),
+        "completed": stats.get("COMPLETE", 0),
+        "cancelled": stats.get("CANCELED", 0),
+        "total": sum(stats.values()),
+        "job_types": classes,
+    }
 
 
 def _get_pending_jobs():
     conn = _get_conn()
     cur = conn.execute("""
-        SELECT REQUEST_ID, REQ_STATUS, REQ_CLASS, PRIORITY, CUST_PROB_DESCR, PLACE_ID
+        SELECT REQUEST_ID, REQ_STATUS, REQ_CLASS, PRIORITY, SEVERITY,
+               CUST_PROB_DESCR, PLACE_ID, USER_DEF21
         FROM request WHERE REQ_STATUS = 'FIELDCOMPLETE'
-        ORDER BY REQUEST_ID DESC
+        ORDER BY
+          CASE WHEN PRIORITY LIKE 'P1%' THEN 1
+               WHEN PRIORITY LIKE 'P2%' THEN 2
+               WHEN PRIORITY LIKE 'P3%' THEN 3
+               ELSE 4 END,
+          REQUEST_ID DESC
     """)
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -78,9 +102,10 @@ def _get_pending_jobs():
 def _get_completed_jobs():
     conn = _get_conn()
     cur = conn.execute("""
-        SELECT r.REQUEST_ID, r.REQ_STATUS, r.REQ_CLASS, r.PRIORITY,
-               r.CUST_PROB_DESCR, r.PROBLEM_CODE, r.PLACE_ID,
-               c.PROBLEM_CODE as P, c.CAUSE_CODE as C, c.RECTIFY_CODE as R, c.METHOD_CODE as M
+        SELECT r.REQUEST_ID, r.REQ_CLASS, r.PRIORITY, r.CUST_PROB_DESCR,
+               r.PLACE_ID, r.USER_DEF21,
+               c.PROBLEM_CODE as P, c.CAUSE_CODE as C,
+               c.RECTIFY_CODE as R, c.METHOD_CODE as M
         FROM request r
         LEFT JOIN close_out c ON r.REQUEST_ID = c.REQUEST_ID
         WHERE r.REQ_STATUS = 'COMPLETE'
@@ -99,8 +124,117 @@ def _get_job(request_id: int):
     return dict(row) if row else None
 
 
+def _priority_label(p: str) -> str:
+    if not p:
+        return "—"
+    mapping = {
+        "P1_URG_1H_4H": "P1 Urgent",
+        "P2_HIGH_6H_1D": "P2 High",
+        "P3_MED_2D_5D": "P3 Medium",
+        "P4_PLAN_10D": "P4 Planned",
+        "P8_PLAN_12M": "P8 Scheduled",
+        "P10_PLAN_7D": "P10 Planned",
+    }
+    return mapping.get(p, p)
+
+
+def _priority_class(p: str) -> str:
+    if not p:
+        return ""
+    if "P1" in p:
+        return "priority-urgent"
+    if "P2" in p:
+        return "priority-high"
+    if "P3" in p:
+        return "priority-medium"
+    return "priority-low"
+
+
+FIELD_LABELS = {
+    "problem_code": "what the problem was",
+    "cause_code": "what caused it",
+    "rectify_code": "how you resolved it",
+    "method_code": "the method or equipment you used",
+}
+
+
+def _build_followup(result: dict, state: dict) -> str:
+    """Build a progressive human-worded follow-up question."""
+    confi = result.get("field_confidence", {})
+    missing = [f for f in FIELD_LABELS if not result.get(f) or confi.get(f, 0) < 0.6]
+
+    if result.get("needs_clarification", {}) and result["needs_clarification"].get("question"):
+        return result["needs_clarification"]["question"]
+
+    if not missing:
+        return "Can you tell me a bit more about what happened?"
+
+    if len(missing) == 1:
+        return f"Nearly there — can you tell me {FIELD_LABELS[missing[0]]}?"
+    elif len(missing) == 2:
+        return f"Thanks for that. Can you also tell me {FIELD_LABELS[missing[0]]} and {FIELD_LABELS[missing[1]]}?"
+    else:
+        parts = [FIELD_LABELS[f] for f in missing[:3]]
+        return f"I need a few more details — {', '.join(parts[:-1])}, and {parts[-1]}?"
+
+
+@weave.op()
+def pipeline_turn(message: str, request_id: int | None, complaint: str | None, transcript: str) -> dict:
+    """Full agent pipeline for one conversation turn — traced in Weave.
+
+    Shows: Vera (voice intake) → GEMI (structuring) → Hade (validation) → WFM (close)
+    """
+    # Stage 1: Vera — voice/text intake processing
+    vera_output = vera.predict(text=message)
+    processed_text = vera_output.get("transcript", message)
+
+    # Build context for structuring
+    full_transcript = (transcript or "") + " " + processed_text
+    context_text = full_transcript
+    if complaint:
+        context_text = f"Reported problem: {complaint}\n\nTechnician close-out: {full_transcript}"
+
+    # Stage 2: GEMI — structure into PCRM codes
+    gemi_output = gemi.structure(context_text)
+
+    if gemi_output.get("needs_clarification"):
+        return {
+            "stage": "clarify",
+            "gemi_output": gemi_output,
+            "transcript": full_transcript,
+        }
+
+    # Stage 3: Hade — validate and correct
+    hade_output = hade.validate_and_correct(context_text, gemi_output, gemi_agent=gemi)
+    codes = {
+        "problem_code": hade_output.get("problem_code"),
+        "cause_code": hade_output.get("cause_code"),
+        "rectify_code": hade_output.get("rectify_code"),
+        "method_code": hade_output.get("method_code"),
+    }
+
+    # Stage 4: WFM — close the job
+    if request_id:
+        hade.close(request_id, codes)
+
+    return {
+        "stage": "confirm",
+        "codes": codes,
+        "transcript": full_transcript,
+        "hade_approved": hade_output.get("_hade_approved", True),
+        "agent_chain": hade_output.get("_agent_chain", "Vera → GEMI → Hade"),
+    }
+
+
 def _advance(state: dict, message: str) -> dict:
-    """Advance the conversation state."""
+    """Advance the conversation state.
+
+    Progressive clarification strategy:
+    - Track how many confident fields we have (0-4)
+    - Only escalate after 3+ stalled rounds (user answered but no new info gained)
+    - Safety cap at 10 turns to avoid infinite loops
+    - Ask targeted questions about specific missing fields
+    """
     state["convo"].append(["you", message])
     state["transcript"] = (state.get("transcript") or "") + " " + message
     state["turn"] = state.get("turn", 0) + 1
@@ -117,16 +251,19 @@ def _advance(state: dict, message: str) -> dict:
             state["complaint"] = results[0].get("CUST_PROB_DESCR", "")
             state["convo"].append(["agent", f"Found job #{state['request_id']} — reported as: \"{state['complaint']}\". What did you find on site, and how did you fix it?"])
         else:
-            state["convo"].append(["agent", "Got it. Tell me about the job — what was the problem, what caused it, and how did you fix it?"])
+            state["convo"].append(["agent", "Tell me about the job — what was the problem, what caused it, and how did you fix it?"])
         return state
 
-    context_text = state["transcript"]
-    if state.get("complaint"):
-        context_text = f"Reported problem: {state['complaint']}\n\nTechnician close-out: {state['transcript']}"
+    # Run the full traced pipeline: Vera → GEMI → Hade → WFM
+    pipeline_result = pipeline_turn(
+        message=message,
+        request_id=state.get("request_id"),
+        complaint=state.get("complaint"),
+        transcript=state.get("transcript", ""),
+    )
 
-    result = gemi.structure(context_text)
-
-    if result.get("needs_clarification"):
+    if pipeline_result["stage"] == "clarify":
+        result = pipeline_result["gemi_output"]
         filled = sum(1 for f in ["problem_code", "cause_code", "rectify_code", "method_code"]
                      if result.get(f) and result.get("field_confidence", {}).get(f, 0) >= 0.6)
         best = state.get("best", 0)
@@ -136,26 +273,19 @@ def _advance(state: dict, message: str) -> dict:
         else:
             state["stall"] = state.get("stall", 0) + 1
 
-        if state.get("stall", 0) >= 2 or state["turn"] > 6:
-            state["convo"].append(["agent", "I don't have enough detail to close this one out. I'll escalate it to the team."])
+        if state.get("stall", 0) >= 3 or state["turn"] > 10:
+            state["convo"].append(["agent",
+                "I've asked a few times but I'm still missing key details to close this out. "
+                "I'll pass this to the team so they can follow up with you directly."])
             state["outcome"] = "ESCALATE"
             return state
 
-        question = result["needs_clarification"].get("question", "Can you tell me more?")
-        state["convo"].append(["agent", f"Thanks. {question}"])
+        followup = _build_followup(result, state)
+        state["convo"].append(["agent", followup])
         return state
 
-    final = hade.validate_and_correct(context_text, result, gemi_agent=gemi)
-    codes = {
-        "problem_code": final.get("problem_code"),
-        "cause_code": final.get("cause_code"),
-        "rectify_code": final.get("rectify_code"),
-        "method_code": final.get("method_code"),
-    }
-
-    if state.get("request_id"):
-        hade.close(state["request_id"], codes)
-
+    # Confirmed — job closed
+    codes = pipeline_result["codes"]
     confirm_msg = (
         f"All set — closed job #{state.get('request_id', 'new')}. "
         f"Problem: {_code_label(codes['problem_code'])}, "
@@ -183,7 +313,7 @@ async def chat_page(request: Request):
     return HTMLResponse(_render_chat(job))
 
 
-async def turn(request: Request):
+async def turn_endpoint(request: Request):
     body = await request.json()
     state = body.get("state", {"convo": [], "transcript": "", "turn": 0})
     message = body.get("message", "")
@@ -200,143 +330,196 @@ async def api_jobs(request: Request):
     return JSONResponse({"jobs": _get_pending_jobs()})
 
 
-# ─── HTML Templates ────────────────────────────────────────────────────────────
+# ─── CSS ───────────────────────────────────────────────────────────────────────
 
 CSS = """
 :root {
-  --bg: #FAFAFA;
+  --bg: #F8FAFC;
   --surface: #FFFFFF;
-  --panel: #F5F5F5;
-  --ink: #1A1A1A;
-  --muted: #6B7280;
+  --panel: #F1F5F9;
+  --ink: #0F172A;
+  --secondary: #475569;
+  --muted: #94A3B8;
   --accent: #2563EB;
   --accent-hover: #1D4ED8;
+  --accent-light: #EFF6FF;
   --success: #059669;
   --success-bg: #ECFDF5;
   --warning: #D97706;
   --warning-bg: #FFFBEB;
   --danger: #DC2626;
   --danger-bg: #FEF2F2;
-  --border: #E5E7EB;
-  --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
-  --shadow-lg: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.04);
+  --border: #E2E8F0;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+  --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1);
   --radius: 8px;
   --radius-lg: 12px;
+  --radius-xl: 16px;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
-  background: var(--bg);
-  color: var(--ink);
-  min-height: 100vh;
-  line-height: 1.5;
-}
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--ink); min-height: 100vh; line-height: 1.6; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+/* Layout */
 .layout { display: flex; min-height: 100vh; }
 .sidebar {
-  width: 260px; background: var(--surface); border-right: 1px solid var(--border);
-  padding: 24px 16px; display: flex; flex-direction: column; position: fixed;
-  top: 0; left: 0; bottom: 0; z-index: 100;
+  width: 260px; background: var(--ink); color: white;
+  padding: 24px 16px; display: flex; flex-direction: column;
+  position: fixed; top: 0; left: 0; bottom: 0; z-index: 100;
 }
-.sidebar .brand { font-size: 1.1rem; font-weight: 700; color: var(--ink); margin-bottom: 8px; }
-.sidebar .subtitle { font-size: 0.75rem; color: var(--muted); margin-bottom: 32px; text-transform: uppercase; letter-spacing: 0.05em; }
-.sidebar nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.sidebar .brand { font-size: 1.25rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 4px; }
+.sidebar .subtitle { font-size: 0.7rem; color: var(--muted); margin-bottom: 36px; text-transform: uppercase; letter-spacing: 0.08em; }
+.sidebar nav { display: flex; flex-direction: column; gap: 2px; flex: 1; }
 .sidebar nav a {
-  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
-  border-radius: var(--radius); color: var(--muted); font-size: 0.9rem;
+  display: flex; align-items: center; gap: 12px; padding: 11px 14px;
+  border-radius: var(--radius); color: rgba(255,255,255,0.6); font-size: 0.88rem;
   font-weight: 500; transition: all 0.15s;
 }
-.sidebar nav a:hover { background: var(--panel); color: var(--ink); text-decoration: none; }
+.sidebar nav a:hover { background: rgba(255,255,255,0.08); color: white; text-decoration: none; }
 .sidebar nav a.active { background: var(--accent); color: white; }
-.sidebar nav a .icon { font-size: 1.1rem; width: 20px; text-align: center; }
+.sidebar nav a .icon { font-size: 1rem; width: 20px; text-align: center; opacity: 0.8; }
 .sidebar nav a .badge {
-  margin-left: auto; background: var(--panel); color: var(--muted);
+  margin-left: auto; background: rgba(255,255,255,0.15); color: rgba(255,255,255,0.9);
   font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; font-weight: 600;
 }
-.sidebar nav a.active .badge { background: rgba(255,255,255,0.2); color: white; }
-.sidebar .footer { margin-top: auto; padding-top: 16px; border-top: 1px solid var(--border); }
-.sidebar .footer a { font-size: 0.8rem; color: var(--muted); display: block; padding: 6px 0; }
+.sidebar nav a.active .badge { background: rgba(255,255,255,0.25); }
+.sidebar .footer { margin-top: auto; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.1); }
+.sidebar .footer a { font-size: 0.78rem; color: rgba(255,255,255,0.5); display: block; padding: 6px 0; }
+.sidebar .footer a:hover { color: white; text-decoration: none; }
 
-.main { margin-left: 260px; flex: 1; padding: 32px 40px; max-width: 1100px; }
-.page-header { margin-bottom: 24px; }
-.page-header h1 { font-size: 1.5rem; font-weight: 700; }
-.page-header p { color: var(--muted); font-size: 0.9rem; margin-top: 4px; }
+.main { margin-left: 260px; flex: 1; padding: 32px 40px; }
+.page-header { margin-bottom: 28px; }
+.page-header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.02em; }
+.page-header p { color: var(--secondary); font-size: 0.9rem; margin-top: 4px; }
 
-.tabs { display: flex; gap: 4px; margin-bottom: 24px; background: var(--panel); padding: 4px; border-radius: var(--radius); width: fit-content; }
+/* Stats */
+.stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
+.stat-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 20px; box-shadow: var(--shadow-sm);
+}
+.stat-card .stat-label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 8px; }
+.stat-card .stat-value { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.02em; }
+.stat-card .stat-sub { font-size: 0.78rem; color: var(--secondary); margin-top: 4px; }
+.stat-card.urgent .stat-value { color: var(--danger); }
+.stat-card.pending .stat-value { color: var(--warning); }
+.stat-card.complete .stat-value { color: var(--success); }
+
+/* Tabs */
+.section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.section-header h2 { font-size: 1.1rem; font-weight: 600; }
+.tabs { display: flex; gap: 4px; background: var(--panel); padding: 4px; border-radius: var(--radius); }
 .tab {
-  padding: 8px 16px; border-radius: 6px; font-size: 0.85rem; font-weight: 500;
-  cursor: pointer; border: none; background: none; color: var(--muted); transition: all 0.15s;
+  padding: 7px 14px; border-radius: 6px; font-size: 0.82rem; font-weight: 500;
+  cursor: pointer; border: none; background: none; color: var(--secondary); transition: all 0.15s;
 }
 .tab:hover { color: var(--ink); }
-.tab.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow); }
+.tab.active { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-sm); }
 
-.card {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius-lg); box-shadow: var(--shadow); overflow: hidden;
-}
-.table-wrap { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+/* Table */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow-sm); overflow: hidden; }
+table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
 thead th {
-  text-align: left; padding: 12px 16px; font-weight: 600; font-size: 0.78rem;
-  text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+  text-align: left; padding: 12px 16px; font-weight: 600; font-size: 0.72rem;
+  text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
   border-bottom: 1px solid var(--border); background: var(--panel);
 }
-tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; cursor: pointer; }
-tbody tr:hover { background: var(--panel); }
+tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
+tbody tr:hover { background: var(--accent-light); }
 tbody tr:last-child { border-bottom: none; }
 tbody td { padding: 14px 16px; vertical-align: middle; }
+.clickable { cursor: pointer; }
 
-.badge-status {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600;
+/* Badges */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 20px; font-size: 0.72rem; font-weight: 600;
 }
 .badge-pending { background: var(--warning-bg); color: var(--warning); }
 .badge-complete { background: var(--success-bg); color: var(--success); }
-.badge-priority { background: var(--danger-bg); color: var(--danger); font-size: 0.72rem; padding: 3px 8px; border-radius: 4px; }
-.badge-priority.p3, .badge-priority.p4 { background: var(--panel); color: var(--muted); }
+.badge-cancelled { background: var(--panel); color: var(--muted); }
+.priority-urgent { background: var(--danger-bg); color: var(--danger); }
+.priority-high { background: #FFF7ED; color: #C2410C; }
+.priority-medium { background: var(--accent-light); color: var(--accent); }
+.priority-low { background: var(--panel); color: var(--secondary); }
+.badge-type { background: var(--panel); color: var(--secondary); border-radius: 4px; padding: 2px 8px; font-size: 0.72rem; }
 
+/* Buttons */
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 8px 16px; border-radius: var(--radius); font-size: 0.85rem;
-  font-weight: 500; cursor: pointer; border: none; transition: all 0.15s;
+  padding: 8px 14px; border-radius: var(--radius); font-size: 0.82rem;
+  font-weight: 500; cursor: pointer; border: none; transition: all 0.15s; text-decoration: none;
 }
 .btn-primary { background: var(--accent); color: white; }
-.btn-primary:hover { background: var(--accent-hover); }
-.btn-ghost { background: none; border: 1px solid var(--border); color: var(--muted); }
-.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+.btn-primary:hover { background: var(--accent-hover); text-decoration: none; }
+.btn-ghost { background: none; border: 1px solid var(--border); color: var(--secondary); }
+.btn-ghost:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 
 .empty-state { text-align: center; padding: 60px 20px; color: var(--muted); }
-.empty-state .icon { font-size: 2.5rem; margin-bottom: 12px; }
-.empty-state h3 { font-size: 1.1rem; color: var(--ink); margin-bottom: 8px; }
+.empty-state .icon { font-size: 2.5rem; margin-bottom: 12px; opacity: 0.5; }
+.empty-state h3 { font-size: 1rem; color: var(--ink); margin-bottom: 4px; }
+.empty-state p { font-size: 0.85rem; }
 
-/* Chat page */
-.chat-layout { display: flex; gap: 24px; height: calc(100vh - 120px); }
-.chat-main { flex: 1; display: flex; flex-direction: column; }
-.chat-sidebar { width: 280px; }
+/* Agent Workflow */
+.workflow-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 24px 28px; box-shadow: var(--shadow-sm); margin-bottom: 28px; }
+.workflow-card h3 { font-size: 0.92rem; font-weight: 700; margin-bottom: 18px; }
+.workflow-pipeline { display: flex; align-items: center; gap: 0; justify-content: center; flex-wrap: wrap; }
+.workflow-node {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 14px 18px; border-radius: var(--radius-lg); background: var(--panel);
+  border: 1px solid var(--border); min-width: 120px; text-align: center;
+  transition: all 0.2s;
+}
+.workflow-node:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.workflow-node .node-icon { font-size: 1.4rem; }
+.workflow-node .node-name { font-size: 0.82rem; font-weight: 700; color: var(--ink); }
+.workflow-node .node-role { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.workflow-node.vera { border-left: 3px solid #7C3AED; }
+.workflow-node.gemi { border-left: 3px solid #2563EB; }
+.workflow-node.hade { border-left: 3px solid #059669; }
+.workflow-node.wfm { border-left: 3px solid #D97706; }
+.workflow-node.orch { border-left: 3px solid #DC2626; }
+.workflow-arrow { color: var(--muted); font-size: 1.2rem; padding: 0 8px; }
+.workflow-sub { font-size: 0.72rem; color: var(--secondary); margin-top: 14px; text-align: center; line-height: 1.7; }
+.workflow-sub code { background: var(--panel); padding: 1px 6px; border-radius: 4px; font-size: 0.7rem; }
+
+.code-group { display: flex; gap: 4px; flex-wrap: wrap; }
+.code-pill { background: var(--panel); border-radius: 4px; padding: 2px 7px; font-size: 0.72rem; font-family: 'SF Mono', monospace; color: var(--secondary); white-space: nowrap; }
+
+.desc-text { color: var(--secondary); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Chat */
+.chat-layout { display: flex; gap: 24px; height: calc(100vh - 140px); }
+.chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.chat-sidebar-panel { width: 300px; flex-shrink: 0; }
 
 .job-card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
-  padding: 20px; box-shadow: var(--shadow);
+  padding: 20px; box-shadow: var(--shadow-sm);
 }
-.job-card h3 { font-size: 0.9rem; font-weight: 600; margin-bottom: 12px; }
-.job-card .field { margin-bottom: 10px; }
-.job-card .field-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 2px; }
-.job-card .field-value { font-size: 0.88rem; }
+.job-card .job-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.job-card .job-card-header h3 { font-size: 0.95rem; font-weight: 700; }
+.job-card .field { margin-bottom: 14px; }
+.job-card .field-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; margin-bottom: 3px; }
+.job-card .field-value { font-size: 0.88rem; color: var(--ink); }
+.job-card .divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 
 .chat-box {
-  flex: 1; overflow-y: auto; padding: 20px;
+  flex: 1; overflow-y: auto; padding: 24px;
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-  display: flex; flex-direction: column; gap: 12px;
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  display: flex; flex-direction: column; gap: 16px;
 }
 .bubble {
-  max-width: 80%; padding: 12px 16px; border-radius: 16px;
-  font-size: 0.9rem; line-height: 1.5; position: relative;
+  max-width: 75%; padding: 12px 18px; border-radius: 18px;
+  font-size: 0.9rem; line-height: 1.6; position: relative;
+  animation: fadeIn 0.2s ease;
 }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 .bubble.agent {
-  align-self: flex-start; background: var(--panel);
+  align-self: flex-start; background: var(--panel); color: var(--ink);
   border-bottom-left-radius: 4px;
 }
 .bubble.you {
@@ -344,116 +527,188 @@ tbody td { padding: 14px 16px; vertical-align: middle; }
   border-bottom-right-radius: 4px;
 }
 .bubble .replay-btn {
-  position: absolute; top: 4px; right: 8px; background: none; border: none;
-  color: var(--muted); cursor: pointer; font-size: 0.75rem; opacity: 0.6;
+  position: absolute; top: 6px; right: 10px; background: none; border: none;
+  cursor: pointer; font-size: 0.7rem; opacity: 0; transition: opacity 0.15s;
 }
+.bubble:hover .replay-btn { opacity: 0.7; }
 .bubble .replay-btn:hover { opacity: 1; }
+.bubble.agent .replay-btn { color: var(--secondary); }
 
 .input-bar {
-  display: flex; gap: 8px; align-items: center;
-  padding: 16px; background: var(--surface);
+  display: flex; gap: 10px; align-items: center;
+  padding: 16px 20px; background: var(--surface);
   border: 1px solid var(--border); border-top: none;
-  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  border-radius: 0 0 var(--radius-xl) var(--radius-xl);
 }
 .input-bar textarea {
   flex: 1; resize: none; border: 1px solid var(--border); border-radius: 24px;
   padding: 12px 20px; font-size: 0.9rem; font-family: inherit;
   min-height: 44px; max-height: 100px; outline: none; line-height: 1.4;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 .input-bar textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,0.1); }
 .btn-mic {
-  width: 44px; height: 44px; border-radius: 50%; border: none;
-  background: var(--panel); color: var(--ink); font-size: 1.2rem;
+  width: 44px; height: 44px; border-radius: 50%; border: 2px solid var(--border);
+  background: var(--surface); color: var(--secondary); font-size: 1.1rem;
   cursor: pointer; transition: all 0.15s; display: flex; align-items: center; justify-content: center;
 }
-.btn-mic:hover { background: var(--border); }
-.btn-mic.active { background: var(--danger); color: white; animation: pulse 1.5s infinite; }
-@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+.btn-mic:hover { border-color: var(--accent); color: var(--accent); }
+.btn-mic.active { border-color: var(--danger); background: var(--danger); color: white; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.08)} }
 .btn-send {
   width: 44px; height: 44px; border-radius: 50%; border: none;
   background: var(--accent); color: white; font-size: 1.1rem;
   cursor: pointer; transition: all 0.15s; display: flex; align-items: center; justify-content: center;
 }
-.btn-send:hover { background: var(--accent-hover); }
-.btn-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-send:hover { background: var(--accent-hover); transform: scale(1.05); }
+.btn-send:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
 .outcome-banner {
-  padding: 16px 20px; border-radius: var(--radius-lg); margin-top: 16px;
-  display: flex; align-items: center; gap: 12px; font-weight: 500;
+  padding: 16px 20px; border-radius: var(--radius-lg); margin-top: 12px;
+  display: flex; align-items: center; gap: 12px; font-weight: 500; font-size: 0.9rem;
 }
-.outcome-banner.confirm { background: var(--success-bg); color: var(--success); }
-.outcome-banner.escalate { background: var(--warning-bg); color: var(--warning); }
+.outcome-banner.confirm { background: var(--success-bg); color: var(--success); border: 1px solid #A7F3D0; }
+.outcome-banner.escalate { background: var(--warning-bg); color: var(--warning); border: 1px solid #FDE68A; }
+.outcome-banner a { font-weight: 600; }
 
-.status-line { font-size: 0.8rem; color: var(--muted); text-align: center; padding: 8px; min-height: 30px; }
-
-.code-pill {
-  display: inline-block; background: var(--panel); border-radius: 4px;
-  padding: 2px 6px; font-size: 0.75rem; font-family: monospace; color: var(--muted);
-}
+.status-line { font-size: 0.78rem; color: var(--muted); text-align: center; padding: 8px; min-height: 28px; }
 """
 
 
 def _render_dashboard():
     pending = _get_pending_jobs()
     completed = _get_completed_jobs()
+    stats = _get_stats()
+
+    urgent_count = sum(1 for j in pending if "P1" in (j.get("PRIORITY") or ""))
 
     pending_rows = ""
     for job in pending:
-        priority_cls = "p3" if "P3" in (job.get("PRIORITY") or "") else ("p4" if "P4" in (job.get("PRIORITY") or "") else "")
+        p_cls = _priority_class(job.get("PRIORITY"))
         pending_rows += f"""
-        <tr onclick="window.location='/chat?id={job['REQUEST_ID']}'">
+        <tr class="clickable" onclick="window.location='/chat?id={job['REQUEST_ID']}'">
           <td><strong>#{job['REQUEST_ID']}</strong></td>
-          <td>{job.get('REQ_CLASS','—')}</td>
-          <td><span class="badge-priority {priority_cls}">{job.get('PRIORITY','—')}</span></td>
-          <td style="max-width:300px">{(job.get('CUST_PROB_DESCR') or '—')[:80]}</td>
-          <td><span class="badge-status badge-pending">Awaiting Close-out</span></td>
-          <td><a href="/chat?id={job['REQUEST_ID']}" class="btn btn-primary" style="font-size:0.78rem;padding:6px 12px">Close out</a></td>
+          <td><span class="badge-type">{job.get('REQ_CLASS','—')}</span></td>
+          <td><span class="badge {p_cls}">{_priority_label(job.get('PRIORITY'))}</span></td>
+          <td><div class="desc-text">{(job.get('CUST_PROB_DESCR') or '—')[:90]}</div></td>
+          <td>{job.get('USER_DEF21','—').replace('_',' ').title() if job.get('USER_DEF21') else '—'}</td>
+          <td><a href="/chat?id={job['REQUEST_ID']}" class="btn btn-primary">Close out &#8250;</a></td>
         </tr>"""
 
     completed_rows = ""
     for job in completed[:30]:
         codes_html = ""
         if job.get("P"):
-            codes_html = f"<span class='code-pill'>{job['P']}</span> <span class='code-pill'>{job.get('C','')}</span> <span class='code-pill'>{job.get('R','')}</span> <span class='code-pill'>{job.get('M','')}</span>"
+            codes_html = f"""<div class="code-group">
+              <span class="code-pill" title="{_code_label(job['P'])}">{job['P']}</span>
+              <span class="code-pill" title="{_code_label(job.get('C'))}">{job.get('C','')}</span>
+              <span class="code-pill" title="{_code_label(job.get('R'))}">{job.get('R','')}</span>
+              <span class="code-pill" title="{_code_label(job.get('M'))}">{job.get('M','')}</span>
+            </div>"""
         completed_rows += f"""
         <tr>
           <td><strong>#{job['REQUEST_ID']}</strong></td>
-          <td>{job.get('REQ_CLASS','—')}</td>
-          <td>{(job.get('CUST_PROB_DESCR') or '—')[:60]}</td>
-          <td>{codes_html or '—'}</td>
-          <td><span class="badge-status badge-complete">Complete</span></td>
+          <td><span class="badge-type">{job.get('REQ_CLASS','—')}</span></td>
+          <td><div class="desc-text">{(job.get('CUST_PROB_DESCR') or '—')[:70]}</div></td>
+          <td>{codes_html or '<span style="color:var(--muted)">—</span>'}</td>
+          <td><span class="badge badge-complete">Complete</span></td>
         </tr>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WFM Dashboard</title><style>{CSS}</style></head><body>
+<title>Mainline — Dashboard</title><style>{CSS}</style></head><body>
 <div class="layout">
   {_sidebar_html('dashboard')}
   <div class="main">
     <div class="page-header">
       <h1>Dashboard</h1>
-      <p>Manage field service tickets — close out completed jobs or review history</p>
+      <p>A direct line from the crew's voice to the work record</p>
     </div>
 
-    <div class="tabs">
-      <button class="tab active" onclick="showTab('pending')">Pending ({len(pending)})</button>
-      <button class="tab" onclick="showTab('completed')">Completed ({len(completed)})</button>
+    <div class="stats-grid">
+      <div class="stat-card urgent">
+        <div class="stat-label">Urgent (P1)</div>
+        <div class="stat-value">{urgent_count}</div>
+        <div class="stat-sub">Requires immediate close-out</div>
+      </div>
+      <div class="stat-card pending">
+        <div class="stat-label">Awaiting Close-out</div>
+        <div class="stat-value">{stats['pending']}</div>
+        <div class="stat-sub">Field complete, need codes</div>
+      </div>
+      <div class="stat-card complete">
+        <div class="stat-label">Completed</div>
+        <div class="stat-value">{stats['completed']}</div>
+        <div class="stat-sub">Successfully closed</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Job Types</div>
+        <div class="stat-value">{stats['job_types']}</div>
+        <div class="stat-sub">Across {stats['total']} total records</div>
+      </div>
+    </div>
+
+    <div class="workflow-card">
+      <h3>Agent Pipeline</h3>
+      <div class="workflow-pipeline">
+        <div class="workflow-node vera">
+          <div class="node-icon">&#127908;</div>
+          <div class="node-name">Vera</div>
+          <div class="node-role">Voice Agent</div>
+        </div>
+        <div class="workflow-arrow">&#8594;</div>
+        <div class="workflow-node orch">
+          <div class="node-icon">&#9881;</div>
+          <div class="node-name">LangGraph</div>
+          <div class="node-role">Orchestrator</div>
+        </div>
+        <div class="workflow-arrow">&#8594;</div>
+        <div class="workflow-node gemi">
+          <div class="node-icon">&#9889;</div>
+          <div class="node-name">GEMI</div>
+          <div class="node-role">Structuring</div>
+        </div>
+        <div class="workflow-arrow">&#8594;</div>
+        <div class="workflow-node hade">
+          <div class="node-icon">&#9989;</div>
+          <div class="node-name">Hade</div>
+          <div class="node-role">Validation</div>
+        </div>
+        <div class="workflow-arrow">&#8594;</div>
+        <div class="workflow-node wfm">
+          <div class="node-icon">&#128451;</div>
+          <div class="node-name">WFM</div>
+          <div class="node-role">Work System</div>
+        </div>
+      </div>
+      <div class="workflow-sub">
+        <code>Vera</code> captures speech &rarr; <code>LangGraph</code> routes intent &rarr; <code>GEMI</code> maps to PCRM codes &rarr; <code>Hade</code> validates &amp; corrects &rarr; <code>WFM</code> closes the job<br>
+        All agents traced via <strong>W&amp;B Weave</strong> &middot; Model: <code>Qwen3-14B</code> via W&amp;B Inference
+      </div>
+    </div>
+
+    <div class="section-header">
+      <h2>Tickets</h2>
+      <div class="tabs">
+        <button class="tab active" onclick="showTab('pending')">Pending ({len(pending)})</button>
+        <button class="tab" onclick="showTab('completed')">Completed ({len(completed)})</button>
+      </div>
     </div>
 
     <div id="tab-pending" class="card">
-      <div class="table-wrap">
+      <div style="overflow-x:auto">
         <table>
-          <thead><tr><th>ID</th><th>Type</th><th>Priority</th><th>Description</th><th>Status</th><th>Action</th></tr></thead>
+          <thead><tr><th>ID</th><th>Type</th><th>Priority</th><th>Description</th><th>Location</th><th></th></tr></thead>
           <tbody>{pending_rows if pending_rows else '<tr><td colspan="6"><div class="empty-state"><div class="icon">&#9989;</div><h3>All caught up!</h3><p>No pending close-outs</p></div></td></tr>'}</tbody>
         </table>
       </div>
     </div>
 
     <div id="tab-completed" class="card" style="display:none">
-      <div class="table-wrap">
+      <div style="overflow-x:auto">
         <table>
-          <thead><tr><th>ID</th><th>Type</th><th>Description</th><th>Codes</th><th>Status</th></tr></thead>
-          <tbody>{completed_rows if completed_rows else '<tr><td colspan="5"><div class="empty-state"><div class="icon">&#128196;</div><h3>No completed jobs yet</h3></div></td></tr>'}</tbody>
+          <thead><tr><th>ID</th><th>Type</th><th>Description</th><th>PCRM Codes</th><th>Status</th></tr></thead>
+          <tbody>{completed_rows if completed_rows else '<tr><td colspan="5"><div class="empty-state"><div class="icon">&#128196;</div><h3>No completed jobs</h3></div></td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -474,20 +729,20 @@ def _sidebar_html(active: str):
     pending_count = len(_get_pending_jobs())
     return f"""
   <div class="sidebar">
-    <div class="brand">WFM Voice Agent</div>
-    <div class="subtitle">Field Service Platform</div>
+    <div class="brand">Mainline</div>
+    <div class="subtitle">Voice Close-Out Platform</div>
     <nav>
       <a href="/" class="{'active' if active=='dashboard' else ''}">
-        <span class="icon">&#128200;</span> Dashboard
+        <span class="icon">&#9776;</span> Dashboard
         <span class="badge">{pending_count}</span>
       </a>
       <a href="/chat" class="{'active' if active=='chat' else ''}">
-        <span class="icon">&#128172;</span> New Close-out
+        <span class="icon">&#127908;</span> Voice Close-Out
       </a>
     </nav>
     <div class="footer">
-      <a href="https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}/weave" target="_blank">&#128279; Weave Traces</a>
-      <a href="https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}" target="_blank">&#128202; W&B Dashboard</a>
+      <a href="https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}/weave" target="_blank">Weave Traces &#8599;</a>
+      <a href="https://wandb.ai/{WANDB_ENTITY}/{WANDB_PROJECT}" target="_blank">W&B Metrics &#8599;</a>
     </div>
   </div>"""
 
@@ -505,35 +760,42 @@ def _render_chat(job: dict | None):
             "request_id": job["REQUEST_ID"],
             "complaint": job.get("CUST_PROB_DESCR", ""),
         })
-        greeting = f"G'day! I can see job #{job['REQUEST_ID']} — reported as: \"{job.get('CUST_PROB_DESCR', '')}\". What did you find on site, and how did you fix it?"
+        greeting = f"G'day! I can see job #{job['REQUEST_ID']} — reported as: \\&quot;{(job.get('CUST_PROB_DESCR') or '').replace(chr(34), '')}\\&quot;. What did you find on site, and how did you fix it?"
         job_sidebar = f"""
-    <div class="chat-sidebar">
+    <div class="chat-sidebar-panel">
       <div class="job-card">
-        <h3>Job #{job['REQUEST_ID']}</h3>
-        <div class="field"><div class="field-label">Status</div><div class="field-value"><span class="badge-status badge-pending">Awaiting Close-out</span></div></div>
+        <div class="job-card-header">
+          <h3>Job #{job['REQUEST_ID']}</h3>
+          <span class="badge badge-pending">Pending</span>
+        </div>
         <div class="field"><div class="field-label">Type</div><div class="field-value">{job.get('REQ_CLASS','—')}</div></div>
-        <div class="field"><div class="field-label">Priority</div><div class="field-value">{job.get('PRIORITY','—')}</div></div>
+        <div class="field"><div class="field-label">Priority</div><div class="field-value"><span class="badge {_priority_class(job.get('PRIORITY'))}">{_priority_label(job.get('PRIORITY'))}</span></div></div>
+        <hr class="divider">
         <div class="field"><div class="field-label">Reported Problem</div><div class="field-value">{job.get('CUST_PROB_DESCR','—')}</div></div>
-        <div class="field"><div class="field-label">Location</div><div class="field-value">{job.get('PLACE_ID','—')}</div></div>
+        <div class="field"><div class="field-label">Location Type</div><div class="field-value">{(job.get('USER_DEF21') or '—').replace('_',' ').title()}</div></div>
+        <div class="field"><div class="field-label">Coordinates</div><div class="field-value" style="font-size:0.78rem;color:var(--muted)">{job.get('PLACE_ID','—')}</div></div>
       </div>
     </div>"""
 
+    # Escape greeting for JS
+    greeting_escaped = greeting.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Close Out{(' #' + str(job['REQUEST_ID'])) if job else ''} — WFM</title><style>{CSS}</style></head><body>
+<title>{'Close Out #' + str(job['REQUEST_ID']) if job else 'Voice Close-Out'} — Mainline</title><style>{CSS}</style></head><body>
 <div class="layout">
   {_sidebar_html('chat')}
   <div class="main">
     <div class="page-header">
       <h1>{'Close Out Job #' + str(job['REQUEST_ID']) if job else 'Voice Close-Out'}</h1>
-      <p>Speak naturally — the mic stays on until you click stop</p>
+      <p>Speak naturally — the mic stays on until you click stop. Each recording starts fresh.</p>
     </div>
 
     <div class="chat-layout">
       <div class="chat-main">
         <div class="chat-box" id="chatBox"></div>
         <div class="input-bar" id="inputBar">
-          <textarea id="userInput" rows="1" placeholder="Describe what you did..."></textarea>
+          <textarea id="userInput" rows="1" placeholder="Describe what you did on site..."></textarea>
           <button class="btn-mic" id="micBtn" title="Click to start speaking">&#127908;</button>
           <button class="btn-send" id="sendBtn" title="Send">&#10148;</button>
         </div>
@@ -558,17 +820,16 @@ let state = {initial_state};
 let speaking = false;
 let recognition = null;
 let listening = false;
+let finalTranscript = '';
 
 function initSpeechRecognition() {{
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {{ statusEl.textContent = 'Speech not supported in this browser — use typing'; return; }}
+  if (!SR) {{ statusEl.textContent = 'Speech not supported — type your response instead'; return; }}
 
   recognition = new SR();
   recognition.continuous = true;
   recognition.interimResults = true;
   recognition.lang = 'en-AU';
-
-  let finalTranscript = '';
 
   recognition.onresult = (e) => {{
     let interim = '';
@@ -595,10 +856,14 @@ function initSpeechRecognition() {{
 
 function startListening() {{
   if (!recognition) return;
+  // RESET transcript each time mic is clicked — fresh start
+  finalTranscript = '';
+  input.value = '';
   listening = true;
   recognition.start();
   micBtn.classList.add('active');
-  micBtn.innerHTML = '&#9209;';
+  micBtn.innerHTML = '&#9632;';
+  micBtn.title = 'Click to stop';
   statusEl.textContent = 'Listening... speak naturally, click stop when done';
 }}
 
@@ -607,9 +872,14 @@ function stopListening() {{
   if (recognition) recognition.stop();
   micBtn.classList.remove('active');
   micBtn.innerHTML = '&#127908;';
+  micBtn.title = 'Click to start speaking';
   statusEl.textContent = '';
   const text = input.value.trim();
-  if (text) {{ sendMessage(text); input.value = ''; }}
+  if (text) {{
+    sendMessage(text);
+    input.value = '';
+    finalTranscript = '';
+  }}
 }}
 
 micBtn.addEventListener('click', () => {{
@@ -618,14 +888,14 @@ micBtn.addEventListener('click', () => {{
 
 sendBtn.addEventListener('click', () => {{
   const text = input.value.trim();
-  if (text) {{ sendMessage(text); input.value = ''; }}
+  if (text) {{ sendMessage(text); input.value = ''; finalTranscript = ''; }}
 }});
 
 input.addEventListener('keydown', (e) => {{
   if (e.key === 'Enter' && !e.shiftKey) {{
     e.preventDefault();
     const text = input.value.trim();
-    if (text) {{ sendMessage(text); input.value = ''; }}
+    if (text) {{ sendMessage(text); input.value = ''; finalTranscript = ''; }}
   }}
 }});
 
@@ -637,7 +907,7 @@ input.addEventListener('input', autoResize);
 
 async function sendMessage(text) {{
   addBubble('you', text);
-  statusEl.textContent = 'Agent thinking...';
+  statusEl.textContent = 'Processing...';
   sendBtn.disabled = true;
 
   try {{
@@ -650,7 +920,7 @@ async function sendMessage(text) {{
     state = data.state;
     renderNewMessages();
   }} catch (err) {{
-    addBubble('agent', 'Error connecting to server.');
+    addBubble('agent', 'Connection error. Please try again.');
   }}
   sendBtn.disabled = false;
   statusEl.textContent = '';
@@ -668,10 +938,10 @@ function renderNewMessages() {{
   }}
 
   if (state.outcome === 'CONFIRM') {{
-    outcomeEl.innerHTML = '<div class="outcome-banner confirm">&#9989; Job closed successfully — <a href="/">back to dashboard</a></div>';
+    outcomeEl.innerHTML = '<div class="outcome-banner confirm">&#9989; Job closed successfully &mdash; <a href="/">Back to dashboard</a></div>';
     inputBar.style.display = 'none';
   }} else if (state.outcome === 'ESCALATE') {{
-    outcomeEl.innerHTML = '<div class="outcome-banner escalate">&#9888; Escalated to team — <a href="/">back to dashboard</a></div>';
+    outcomeEl.innerHTML = '<div class="outcome-banner escalate">&#9888;&#65039; Escalated to supervisor &mdash; <a href="/">Back to dashboard</a></div>';
     inputBar.style.display = 'none';
   }}
 
@@ -681,12 +951,14 @@ function renderNewMessages() {{
 function addBubble(role, text) {{
   const div = document.createElement('div');
   div.className = 'bubble ' + role;
-  div.textContent = text;
+  const span = document.createElement('span');
+  span.textContent = text;
+  div.appendChild(span);
   if (role === 'agent') {{
     const btn = document.createElement('button');
     btn.className = 'replay-btn';
     btn.textContent = '\\uD83D\\uDD0A';
-    btn.onclick = () => speakText(text);
+    btn.onclick = (e) => {{ e.stopPropagation(); speakText(text); }};
     div.appendChild(btn);
   }}
   chatBox.appendChild(div);
@@ -695,18 +967,41 @@ function addBubble(role, text) {{
 
 function speakText(text) {{
   if (speaking) speechSynthesis.cancel();
+  // Pause mic while agent speaks so it doesn't record TTS output
+  let wasListening = listening;
+  if (listening) {{
+    listening = false;
+    if (recognition) recognition.stop();
+    micBtn.classList.remove('active');
+    micBtn.innerHTML = '&#127908;';
+    statusEl.textContent = 'Agent speaking...';
+  }}
   const utter = new SpeechSynthesisUtterance(text);
   utter.rate = 1.0;
   utter.onstart = () => {{ speaking = true; }};
-  utter.onend = () => {{ speaking = false; }};
+  utter.onend = () => {{
+    speaking = false;
+    // Resume mic if it was active before agent spoke
+    if (wasListening) {{
+      finalTranscript = input.value;
+      listening = true;
+      recognition.start();
+      micBtn.classList.add('active');
+      micBtn.innerHTML = '&#9632;';
+      statusEl.textContent = 'Listening... speak naturally, click stop when done';
+    }} else {{
+      statusEl.textContent = '';
+    }}
+  }};
   speechSynthesis.speak(utter);
 }}
 
 // Init
 initSpeechRecognition();
-addBubble('agent', `{greeting.replace('"', '\\"')}`);
+const greetingText = `{greeting_escaped}`;
+addBubble('agent', greetingText);
 renderedCount = 0;
-speakText(`{greeting.replace('"', '\\"')}`);
+speakText(greetingText);
 </script>
 </body></html>"""
 
@@ -717,7 +1012,7 @@ app = Starlette(
     routes=[
         Route("/", homepage),
         Route("/chat", chat_page),
-        Route("/turn", turn, methods=["POST"]),
+        Route("/turn", turn_endpoint, methods=["POST"]),
         Route("/api/jobs", api_jobs),
     ],
 )
@@ -725,6 +1020,7 @@ app = Starlette(
 
 if __name__ == "__main__":
     weave.init(WANDB_FULL_PROJECT)
-    print(f"\n  WFM Voice Agent — http://127.0.0.1:8000")
+    print(f"\n  Mainline — http://127.0.0.1:8000")
+    print(f"  A direct line from the crew's voice to the work record")
     print(f"  Weave: https://wandb.ai/{WANDB_FULL_PROJECT}/weave\n")
     uvicorn.run(app, host="127.0.0.1", port=8000)

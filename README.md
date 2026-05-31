@@ -73,7 +73,6 @@ flowchart LR
     A[🎤 Technician<br/>voice report] --> V[Vera<br/>Voice Agent · STT]
     V --> C{Classify<br/>Intent}
     C -->|close_out| S[Hade<br/>Search WFM]
-    C -->|new_fault| G
     S --> G[GEMI<br/>Structuring Agent]
     G -->|low confidence| K[Clarification<br/>loop]
     K --> G

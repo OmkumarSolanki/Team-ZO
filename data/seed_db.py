@@ -92,6 +92,17 @@ def seed_database():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE water_break (
+            REQUEST_ID INTEGER,
+            TASK_ID INTEGER,
+            CONTRIBUTING_FACTOR TEXT,
+            PROBABLE_CAUSE TEXT,
+            PIPE_DEPTH REAL,
+            PRIMARY KEY (REQUEST_ID, TASK_ID)
+        )
+    """)
+
     requests = load_sheet(wb, "request", REQUEST_COLS)
     for r in requests:
         if r.get("REQUEST_ID"):
@@ -116,10 +127,19 @@ def seed_database():
                 [t.get("TASK_ID"), t.get("COMBINED_TEXT")],
             )
 
+    water_break_cols = ["REQUEST_ID", "TASK_ID", "CONTRIBUTING_FACTOR", "PROBABLE_CAUSE", "PIPE_DEPTH"]
+    water_breaks = load_sheet(wb, "close_out_water_break", water_break_cols)
+    for w in water_breaks:
+        if w.get("REQUEST_ID") and w.get("TASK_ID"):
+            cur.execute(
+                "INSERT OR IGNORE INTO water_break VALUES (?,?,?,?,?)",
+                [w.get(col) for col in water_break_cols],
+            )
+
     conn.commit()
 
     counts = {}
-    for table in ["request", "close_out", "task_text"]:
+    for table in ["request", "close_out", "task_text", "water_break"]:
         cur.execute(f"SELECT COUNT(*) FROM {table}")
         counts[table] = cur.fetchone()[0]
 

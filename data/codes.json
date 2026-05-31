@@ -1,0 +1,266 @@
+{
+  "problem": [
+    {
+      "label": "Subsidence",
+      "code": "P_004"
+    },
+    {
+      "label": "Low Pressure",
+      "code": "P_LPR"
+    },
+    {
+      "label": "Broken",
+      "code": "P_BKN"
+    },
+    {
+      "label": "No Problem Found",
+      "code": "P_001"
+    },
+    {
+      "label": "Aesthetics/Appearance",
+      "code": "P_AES"
+    },
+    {
+      "label": "Blocked",
+      "code": "P_BLK"
+    },
+    {
+      "label": "Leaking",
+      "code": "P_LKG"
+    },
+    {
+      "label": "Unable to locate",
+      "code": "P_LOC"
+    },
+    {
+      "label": "Abnormal Noise",
+      "code": "P_NOI"
+    },
+    {
+      "label": "Abnormal Water Quality",
+      "code": "P_WAT"
+    },
+    {
+      "label": "Not Hunter Water Asset",
+      "code": "P_002"
+    },
+    {
+      "label": "Closed out in AOMS",
+      "code": "P_AOMS"
+    },
+    {
+      "label": "Odour",
+      "code": "P_ODR"
+    },
+    {
+      "label": "No Water Supply",
+      "code": "P_SUP"
+    },
+    {
+      "label": "Raise/Lower/Adjust/Install",
+      "code": "P_003"
+    }
+  ],
+  "cause": [
+    {
+      "label": "Wastewater Network (Gravity)",
+      "code": "C_001"
+    },
+    {
+      "label": "Cause Code Missing",
+      "code": "C_MIS"
+    },
+    {
+      "label": "Wastewater Pumping Station",
+      "code": "C_002"
+    },
+    {
+      "label": "Wastewater Treatment Plant",
+      "code": "C_003"
+    },
+    {
+      "label": "Ground Movement",
+      "code": "C_008"
+    },
+    {
+      "label": "Gas Attack",
+      "code": "C_012"
+    },
+    {
+      "label": "Vacuum Sewer Fault",
+      "code": "C_019"
+    },
+    {
+      "label": "Corrosion",
+      "code": "C_011"
+    },
+    {
+      "label": "Dumping/Rubbish",
+      "code": "C_005"
+    },
+    {
+      "label": "Related job",
+      "code": "C_009"
+    },
+    {
+      "label": "Roots Ingress",
+      "code": "C_VEG"
+    },
+    {
+      "label": "Closed out in AOMS",
+      "code": "C_AOMS"
+    },
+    {
+      "label": "External Material Ingress",
+      "code": "C_006"
+    },
+    {
+      "label": "Storm (Insufficient Capacity)",
+      "code": "C_010"
+    },
+    {
+      "label": "Graffiti",
+      "code": "C_007"
+    },
+    {
+      "label": "Vandalism/3rd Party Damage",
+      "code": "C_VDL"
+    },
+    {
+      "label": "No Cause Found",
+      "code": "C_NCF"
+    },
+    {
+      "label": "Boundary kit failure (PSS fault)",
+      "code": "C_024"
+    },
+    {
+      "label": "Insufficient Capacity",
+      "code": "C_CAP"
+    },
+    {
+      "label": "Construction Job",
+      "code": "C_034"
+    },
+    {
+      "label": "Expected Wear and Tear",
+      "code": "C_WER"
+    }
+  ],
+  "rectify": [
+    {
+      "label": "Private plumber required",
+      "code": "R_002"
+    },
+    {
+      "label": "HWC contractor rectify",
+      "code": "R_003"
+    },
+    {
+      "label": "Rectification code missing",
+      "code": "R_MIS"
+    },
+    {
+      "label": "Unable to rectify",
+      "code": "R_UNR"
+    },
+    {
+      "label": "Isolated/Recharged",
+      "code": "R_ISO"
+    },
+    {
+      "label": "Refit/Minor servicing",
+      "code": "R_RFT"
+    },
+    {
+      "label": "Repaired",
+      "code": "R_RPR"
+    },
+    {
+      "label": "Not HW issue",
+      "code": "R_001"
+    },
+    {
+      "label": "Closed out in AOMS",
+      "code": "R_AOMS"
+    },
+    {
+      "label": "Checked/Inspected",
+      "code": "R_CHK"
+    },
+    {
+      "label": "Cleaned/Cleared",
+      "code": "R_CLE"
+    },
+    {
+      "label": "Replaced",
+      "code": "R_RPL"
+    },
+    {
+      "label": "Adjusted/Reset",
+      "code": "R_ADJ"
+    }
+  ],
+  "method": [
+    {
+      "label": "Lowered",
+      "code": "M_LOW"
+    },
+    {
+      "label": "Referred - Operations",
+      "code": "M_004"
+    },
+    {
+      "label": "No rectification required",
+      "code": "M_NRR"
+    },
+    {
+      "label": "Method code missing",
+      "code": "M_MIS"
+    },
+    {
+      "label": "Jetted/Flushed",
+      "code": "M_FLU"
+    },
+    {
+      "label": "CCTV",
+      "code": "M_CAM"
+    },
+    {
+      "label": "Raised",
+      "code": "M_RAI"
+    },
+    {
+      "label": "Machine rodded",
+      "code": "M_003"
+    },
+    {
+      "label": "Installed clamp",
+      "code": "M_CLA"
+    },
+    {
+      "label": "Closed Out in AOMS",
+      "code": "M_AOMS"
+    },
+    {
+      "label": "Resealed or installed component",
+      "code": "M_LID"
+    },
+    {
+      "label": "Customer/3rd Party notified",
+      "code": "M_001"
+    },
+    {
+      "label": "Exchanged/Installed new",
+      "code": "M_002"
+    },
+    {
+      "label": "Box Adjustment",
+      "code": "M_BOX"
+    },
+    {
+      "label": "Opened",
+      "code": "M_OVL"
+    }
+  ]
+}

@@ -1,0 +1,111 @@
+{
+  "close_out": {
+    "required": [
+      "request_id",
+      "problem_code",
+      "cause_code",
+      "rectify_code",
+      "method_code"
+    ],
+    "fields": {
+      "request_id": {
+        "type": "integer"
+      },
+      "problem_code": {
+        "type": "enum",
+        "source": "codes.problem"
+      },
+      "cause_code": {
+        "type": "enum",
+        "source": "codes.cause"
+      },
+      "rectify_code": {
+        "type": "enum",
+        "source": "codes.rectify"
+      },
+      "method_code": {
+        "type": "enum",
+        "source": "codes.method"
+      },
+      "req_status": {
+        "type": "enum",
+        "values": [
+          "COMPLETE"
+        ]
+      }
+    }
+  },
+  "new_fault": {
+    "required": [
+      "req_class",
+      "priority",
+      "severity",
+      "cust_prob_descr"
+    ],
+    "fields": {
+      "req_class": {
+        "type": "enum",
+        "values": [
+          "HYDRANT_MAINTENANCE",
+          "INSPECT",
+          "LEAK",
+          "MANHOLE_MAINTENANCE",
+          "METER_FRAME_LEAK",
+          "NO_WATER",
+          "OTHER",
+          "OVERFLOW_SHAFT",
+          "PATHTAP_FAULT",
+          "RESTORE_SUPPLY_AFTER_RESTRICTION",
+          "SEWER_MANHOLE_OVERFLOWING",
+          "SEWER_SHAFT_HOLDING",
+          "START_DAY",
+          "WATER_QUALITY_DIRTY_WATER"
+        ]
+      },
+      "priority": {
+        "type": "enum",
+        "values": [
+          "P1_URG_1H_4H",
+          "P2_HIGH_6H_1D",
+          "P3_MED_2D_5D",
+          "P4_PLAN_10D",
+          "P8_PLAN_12M",
+          "P10_PLAN_7D"
+        ]
+      },
+      "severity": {
+        "type": "enum",
+        "values": [
+          "LOW",
+          "MEDIUM",
+          "HIGH"
+        ]
+      },
+      "user_def21": {
+        "type": "enum",
+        "values": [
+          "DRIVEWAY",
+          "FOOTPATH",
+          "FOOTPATH_CONCRETE",
+          "FOOTPATH_GRASS",
+          "PARK_RESERVE",
+          "ROAD",
+          "YARD"
+        ]
+      },
+      "cust_prob_descr": {
+        "type": "text"
+      }
+    }
+  },
+  "business_rules": [
+    {
+      "rule": "P1_URG requires severity HIGH",
+      "check": "if priority == 'P1_URG_1H_4H' then severity must be 'HIGH'"
+    },
+    {
+      "rule": "COMPLETE requires all PCRM codes",
+      "check": "if req_status == 'COMPLETE' then problem_code, cause_code, rectify_code, method_code must all be set"
+    }
+  ]
+}
